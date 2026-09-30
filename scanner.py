@@ -23,6 +23,10 @@ Usage:
 Rate limits are enforced client side per endpoint family: GeckoTerminal's
 public API allows 30 calls/minute, DexScreener 60/minute for token profiles and
 300/minute for token pairs.
+
+An HTTP 429 that carries no ``Retry-After`` header cools the *whole host* down
+for 20s, then 40s, 80s, doubling up to 120s - and every remaining call of the
+pass waits that cooldown out rather than going back for more a second later.
 """
 
 from __future__ import annotations
@@ -60,6 +64,12 @@ SOURCES = ("geckoterminal", "dexscreener")
 GECKOTERMINAL_CALLS_PER_MINUTE = 30
 PROFILES_PER_MINUTE = 60
 TOKEN_PAIRS_PER_MINUTE = 300
+# A 429 without a Retry-After header cools the *whole host* down: 20s, 40s, 80s,
+# doubling up to RATE_LIMIT_MAX_BACKOFF.  The streak is counted per client rather
+# than per call, so one rate-limited response slows down every later call in the
+# pass instead of each call starting its escalation over again.
+RATE_LIMIT_BACKOFF = 20.0
+RATE_LIMIT_MAX_BACKOFF = 120.0
 # Snapshot milestones: a pair gets one row per label, taken once its age passes it.
 SNAPSHOT_LABELS: tuple[tuple[str, int], ...] = (("5m", 300), ("15m", 900), ("1h", 3600), ("4h", 14400))
 DEFAULT_SNAPSHOT_GRACE_MINUTES = 15.0
@@ -264,9 +274,9 @@ class RateLimiter:
 class ApiClient(ABC):
     """Shared HTTP plumbing for the discovery sources.
 
-    Owns the HTTP client, the retry/backoff logic, ``Retry-After`` handling and
-    the per-endpoint rate limiters; subclasses only describe how to turn their
-    own payloads into :class:`NewPair` objects.
+    Owns the HTTP client, the retry/backoff logic, ``Retry-After`` handling, the
+    host-wide rate-limit cooldown and the per-endpoint rate limiters; subclasses
+    only describe how to turn their own payloads into :class:`NewPair` objects.
     """
 
     name = "api"
@@ -279,11 +289,22 @@ class ApiClient(ABC):
         max_attempts: int = 4,
         base_backoff: float = 2.0,
         max_backoff: float = 60.0,
+        rate_limit_backoff: float = RATE_LIMIT_BACKOFF,
+        rate_limit_max_backoff: float = RATE_LIMIT_MAX_BACKOFF,
     ) -> None:
         self.max_attempts = max(1, int(max_attempts))
         self.base_backoff = max(0.1, float(base_backoff))
         self.max_backoff = max(self.base_backoff, float(max_backoff))
+        self.rate_limit_backoff = max(0.0, float(rate_limit_backoff))
+        self.rate_limit_max_backoff = max(self.rate_limit_backoff, float(rate_limit_max_backoff))
         self._limiters: list[RateLimiter] = []
+        # Rate limiting is a property of the host, not of one request: a 429 sets a
+        # cooldown deadline that *every* later call to this client waits out, and a
+        # streak counter that keeps doubling until the host starts answering again.
+        self._cooldown_until = 0.0
+        self._rate_limit_streak = 0
+        # Set by main() so long cooldowns do not have to run to completion on shutdown.
+        self.stop_event: threading.Event | None = None
 
         self._client = httpx.Client(
             base_url=base_url,
@@ -343,6 +364,43 @@ class ApiClient(ABC):
             seconds = (deadline - utc_now()).total_seconds()
         return max(1.0, min(seconds, 120.0))
 
+    def _sleep(self, seconds: float) -> bool:
+        """Sleep ``seconds``, returning ``True`` when a stop was requested early.
+
+        Cooldowns can run to two minutes, so they are sliced and checked against
+        ``stop_event``: a shutdown should cut them short rather than sit them out.
+        """
+        deadline = time.monotonic() + max(0.0, seconds)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self.stop_event is not None and self.stop_event.is_set():
+                return True
+            time.sleep(min(remaining, 1.0))
+
+    def _await_cooldown(self, path: str) -> bool:
+        """Wait out any host-wide rate-limit cooldown before hitting ``path``.
+
+        This is what keeps a *pass* patient: one rate-limited response parks every
+        later call to this host - other endpoints and batches included - instead of
+        letting them resume at the limiter's normal spacing a second or two later.
+        Returns ``True`` when a stop was requested while waiting.
+        """
+        remaining = self._cooldown_until - time.monotonic()
+        if remaining <= 0:
+            return False
+        log.info("rate-limit cooldown active - waiting %.1fs before %s", remaining, path)
+        return self._sleep(remaining)
+
+    def _rate_limit_delay(self) -> float:
+        """Next cooldown length for a 429 without ``Retry-After``: 20s, 40s, 80s ... 120s."""
+        self._rate_limit_streak += 1
+        return min(
+            self.rate_limit_backoff * (2 ** (self._rate_limit_streak - 1)),
+            self.rate_limit_max_backoff,
+        )
+
     def _get_json(self, path: str, *, limiter: RateLimiter, params: dict[str, Any] | None = None) -> Any | None:
         """GET ``path`` and decode JSON, retrying transient failures.
 
@@ -351,6 +409,9 @@ class ApiClient(ABC):
         cycle" and moves on rather than crashing).
         """
         for attempt in range(1, self.max_attempts + 1):
+            if self._await_cooldown(path):
+                log.info("stop requested - abandoning %s", path)
+                return None
             limiter.acquire()
             try:
                 response = self._client.get(path, params=params)
@@ -364,13 +425,22 @@ class ApiClient(ABC):
                 continue
 
             if response.status_code == 429:
-                delay = self._retry_after(response) or self._backoff_delay(attempt, base=5.0)
+                retry_after = self._retry_after(response)
+                delay = retry_after if retry_after is not None else self._rate_limit_delay()
+                # The cooldown belongs to the host, not to this one request: every
+                # later call - other endpoints and the remaining batches of this
+                # pass included - waits it out instead of resuming at 2s spacing.
+                self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
                 limiter.penalize(delay)
                 log.warning(
-                    "rate limited (HTTP 429) on %s - cooling down %.1fs (attempt %d/%d)",
-                    path, delay, attempt, self.max_attempts,
+                    "rate limited (HTTP 429) on %s - cooling down all %s calls for %.1fs%s (attempt %d/%d)",
+                    path, self.name, delay,
+                    " (Retry-After)" if retry_after is not None else " (no Retry-After)",
+                    attempt, self.max_attempts,
                 )
-                time.sleep(delay)
+                if self._sleep(delay):
+                    log.info("stop requested - abandoning %s", path)
+                    return None
                 continue
 
             if 500 <= response.status_code < 600:
@@ -392,10 +462,13 @@ class ApiClient(ABC):
                 return None
 
             try:
-                return response.json()
+                payload = response.json()
             except ValueError:
                 log.error("invalid JSON from %s - skipping this resource", path)
                 return None
+
+            self._rate_limit_streak = 0  # the host is answering again; start fresh next time
+            return payload
 
         log.error("giving up on %s after %d attempts", path, self.max_attempts)
         return None
@@ -1162,6 +1235,7 @@ def main(argv: list[str] | None = None) -> int:
 
     store = Store(args.db)
     source = make_source(args)
+    source.stop_event = stop_event  # lets a long rate-limit cooldown end on shutdown
     snapshot_client: ApiClient | None = None
     try:
         snapshotter: Snapshotter | None = None
@@ -1171,6 +1245,7 @@ def main(argv: list[str] | None = None) -> int:
                 snapshot_client = source
             else:
                 snapshot_client = GeckoTerminalClient(timeout=args.timeout, max_attempts=args.max_attempts)
+                snapshot_client.stop_event = stop_event
             snapshotter = Snapshotter(snapshot_client, store, grace_minutes=args.snapshot_grace_minutes)
 
         pairs, tokens = store.counts()

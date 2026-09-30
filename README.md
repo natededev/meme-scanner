@@ -261,10 +261,16 @@ label  snapshots  alive  dead  mortality  median mcap  median chg  mean chg
   scanner inside the published budgets (GeckoTerminal 30 req/min for
   `new_pools`; DexScreener 60 req/min for token profiles and 300 req/min for
   token pairs) by spacing requests out, so it does not provoke 429s.
-* **HTTP 429** – the `Retry-After` header is honoured when present, otherwise an
-  exponential backoff (5s, 10s, 20s … capped at 60s, with jitter) is used, and
-  the endpoint's limiter is *penalised* so the whole client slows down instead of
-  hammering the API.
+* **HTTP 429** – the `Retry-After` header is honoured when present (capped at
+  120s). Without that header the scanner assumes the host wants real breathing
+  room and cools down **the whole host**: 20s, then 40s, 80s, doubling up to
+  120s. The streak is counted per client rather than per request, so a second
+  rate-limited response inside the same pass doubles again instead of restarting
+  at 20s, and it resets only once the API answers. Every later call - other
+  endpoints and the remaining snapshot batches of the pass included - waits the
+  cooldown out first, so a rate-limited pass parks instead of going back for more
+  a second or two later. The endpoint's limiter is *penalised* as well, so the
+  per-endpoint budgets keep working as before.
 * **HTTP 5xx, timeouts, connection resets** (`httpx.RequestError`) – retried up
   to `--max-attempts` with exponential backoff and jitter; the pass then
   continues with the next item.
