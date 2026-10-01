@@ -17,13 +17,16 @@ Jupiter's docs (developers.jup.ag, checked for this script) specify:
 The universe is pumpswap pairs first seen at least ``MIN_AGE_HOURS`` ago whose
 5m snapshot showed a real market cap and liquidity, but whose 1h liquidity was
 missing, under $100, or under 5% of the 5m liquidity.  Those are exactly the
-pools a paper backtest would still treat as sellable.
+pools a paper backtest would still treat as sellable.  ``--universe healthy``
+instead takes the control group: pools that kept at least half their liquidity,
+so the two can be compared.
 
 Output is plain ASCII so it survives a Windows cp1252 console or Termux.
 
 Usage:
     python sellcheck.py --api-key KEY
     python sellcheck.py --n 10 --base-url https://api.jup.ag
+    python sellcheck.py --universe healthy   # control group: liquidity held
 """
 
 from __future__ import annotations
@@ -58,6 +61,19 @@ MIN_ENTRY_LIQUIDITY = 1500.0
 
 #: Only pools seen at least this long ago, so the 1h snapshot has had time to land.
 MIN_AGE_HOURS = 6.0
+
+#: ``drained`` = the 1h liquidity vanished; ``healthy`` = it mostly held.
+UNIVERSE_DRAINED = "drained"
+UNIVERSE_HEALTHY = "healthy"
+UNIVERSE_CHOICES = (UNIVERSE_DRAINED, UNIVERSE_HEALTHY)
+DEFAULT_UNIVERSE = UNIVERSE_DRAINED
+
+#: A drained pool's 1h liquidity is missing, under this, or under this fraction.
+DRAINED_MIN_EXIT_LIQUIDITY = 100.0
+DRAINED_EXIT_LIQUIDITY_RATIO = 0.05
+
+#: A healthy pool's 1h liquidity is at least this fraction of the 5m figure.
+HEALTHY_EXIT_LIQUIDITY_RATIO = 0.50
 
 #: Jupiter's USDC mint on Solana.
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -98,8 +114,8 @@ ORDER BY p.first_seen
 """
 
 
-def load_candidates(path: str, now: datetime) -> list[dict[str, Any]]:
-    """Pools whose liquidity looked sellable at 5m and gone by 1h.
+def load_candidates(path: str, now: datetime, universe: str = UNIVERSE_DRAINED) -> list[dict[str, Any]]:
+    """Pools whose liquidity drained by 1h, or --universe healthy, which held.
 
     Opens SQLite read-only so the check never runs the scanner's schema.  The
     "now" for the age test is taken from the caller so runs are reproducible.
@@ -129,12 +145,17 @@ def load_candidates(path: str, now: datetime) -> list[dict[str, Any]]:
         if entry_price is None or float(entry_price) <= 0.0:
             continue
         exit_liquidity = row["exit_liquidity"]
-        liquidity_gone = (
+        drained = (
             exit_liquidity is None
-            or float(exit_liquidity) < 100.0
-            or float(exit_liquidity) < float(entry_liquidity) * 0.05
+            or float(exit_liquidity) < DRAINED_MIN_EXIT_LIQUIDITY
+            or float(exit_liquidity) < float(entry_liquidity) * DRAINED_EXIT_LIQUIDITY_RATIO
         )
-        if not liquidity_gone:
+        healthy = (
+            exit_liquidity is not None
+            and float(exit_liquidity) >= float(entry_liquidity) * HEALTHY_EXIT_LIQUIDITY_RATIO
+        )
+        wanted = drained if universe == UNIVERSE_DRAINED else healthy
+        if not wanted:
             continue
         candidates.append(
             {
@@ -235,6 +256,30 @@ def fetch_quote(
         "error": "",
         "detail": "",
     }
+
+
+def clean_api_key(raw: str | None) -> str | None:
+    """Strip every whitespace character out of a pasted API key.
+
+    Keys get copied with trailing newlines or stray spaces often enough that the
+    header would otherwise be sent malformed and rejected as unauthorised.
+    """
+    if raw is None:
+        return None
+    stripped = "".join(raw.split())
+    return stripped or None
+
+
+def mask_api_key(key: str | None) -> str:
+    """A safe stand-in for a key, for anywhere one has to be named."""
+    return "jup_****" if key else "none"
+
+
+def redact(text: str, key: str | None) -> str:
+    """Remove the key from any text destined for stdout, a note or an error."""
+    if not key or not text:
+        return text
+    return text.replace(key, mask_api_key(key))
 
 
 def _error_message(body: str) -> str:
@@ -367,9 +412,9 @@ def check_token(
         item["note"] = f"{amount} units @ {decimals}dp"
         return item
 
-    item["note"] = response["error"]
+    item["note"] = redact(response["error"], args.api_key)
     if response.get("detail"):
-        item["note"] += f": {response['detail']}"
+        item["note"] += f": {redact(response['detail'], args.api_key)}"
     # A retryable failure means we never learned whether a route existed.
     if response["error"].startswith(("HTTP 429", "network", "timeout")):
         item["note"] += " (unknown, not counted as no-route)"
@@ -387,6 +432,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--db", default=DEFAULT_DB, metavar="PATH", help="SQLite file (default: %(default)s)")
     parser.add_argument("--n", type=int, default=DEFAULT_SAMPLE, metavar="COUNT", help="tokens to sample (default: 30)")
+    parser.add_argument(
+        "--universe",
+        choices=UNIVERSE_CHOICES,
+        default=DEFAULT_UNIVERSE,
+        # argparse %-expands help strings, so a literal %% is needed here.
+        help="which pools to check: 'drained' (default) had their 1h liquidity missing, "
+        "under $100, or under 5%% of the 5m figure; 'healthy' kept at least half of it",
+    )
     parser.add_argument("--size", type=float, default=DEFAULT_SIZE_USD, metavar="USD", help="sell size per token (default: $20)")
     parser.add_argument("--api-key", default=None, metavar="KEY", help="Jupiter x-api-key (the free tier requires one)")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, metavar="URL", help=f"API base URL (default: {DEFAULT_BASE_URL})")
@@ -439,26 +492,40 @@ def _mock_opener(path: str) -> Any:
     return opener
 
 
+def _universe_note(universe: str) -> str:
+    """Plain-English restatement of what the selected universe means."""
+    if universe == UNIVERSE_HEALTHY:
+        return f"1h liquidity at least {HEALTHY_EXIT_LIQUIDITY_RATIO:.0%} of the 5m figure"
+    return (
+        "1h liquidity missing, under "
+        f"${DRAINED_MIN_EXIT_LIQUIDITY:,.0f}, or under "
+        f"{DRAINED_EXIT_LIQUIDITY_RATIO:.0%} of the 5m figure"
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Sample collapsed-liquidity pools and ask Jupiter to price a sell."""
     args = build_parser().parse_args(argv)
     make_output_robust()
+    # A pasted key often carries a newline or a trailing space; strip it before
+    # it ever reaches a header.  It is never printed or logged.
+    args.api_key = clean_api_key(args.api_key)
 
     try:
         now = newest_first_seen(args.db)
         if now is None:
             print(f"{args.db} holds no pairs yet; run scanner.py first.")
             return 1
-        candidates = load_candidates(args.db, now)
+        candidates = load_candidates(args.db, now, args.universe)
     except sqlite3.Error as exc:
         print(f"{args.db}: {exc}", file=sys.stderr)
         print("hint: run scanner.py against this database first; it creates the snapshots table.", file=sys.stderr)
         return 1
 
     if not candidates:
-        print(f"No pools in {args.db} match the filter (dex={DEX}, age >= {MIN_AGE_HOURS:.0f}h, "
-              f"5m cap >= ${MIN_ENTRY_MARKET_CAP:,.0f}, 5m liquidity >= ${MIN_ENTRY_LIQUIDITY:,.0f}, "
-              "1h liquidity missing/under $100/under 5%).")
+        print(f"No pools in {args.db} match the filter (universe={args.universe}, dex={DEX}, "
+              f"age >= {MIN_AGE_HOURS:.0f}h, 5m cap >= ${MIN_ENTRY_MARKET_CAP:,.0f}, "
+              f"5m liquidity >= ${MIN_ENTRY_LIQUIDITY:,.0f}, {_universe_note(args.universe)}).")
         return 0
 
     rng = random.Random(args.seed)
@@ -475,6 +542,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print_csv(results)
     else:
         print(f"sellcheck -- {args.db}")
+        print(f"universe: {args.universe} ({_universe_note(args.universe)})")
         print(f"{len(candidates):,} candidate pool(s); checked {len(results)} at ${args.size:,.2f} each "
               f"(assumed {args.decimals} decimals), slippage {args.slippage_bps} bps")
         print(f"quotes from {args.base_url}{QUOTE_PATH}" + ("  [MOCKED]" if args.mock else ""))
