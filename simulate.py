@@ -23,7 +23,12 @@ the 15m snapshot instead, and buckets on its market cap and liquidity).  Costs, 
 optional flags: ``--size`` notional per trade, ``--fee`` per side, and price impact
 per side of about ``2 * size / liquidity_usd`` at the time of that side's trade
 (constant-product approximation).  A pair that is dead or missing at 1h returns
--100%, as does one whose exit liquidity is below 20% of its entry liquidity.
+-100%.  ``--exit-rule`` chooses what else counts as a total loss: the default
+``liq`` also books a loss when the exit liquidity is missing or under a fifth of
+entry, while ``price`` books one only when the 1h price is under a tenth of the
+entry price.  Exit impact always uses the 1h liquidity when it is available, but
+never less than a tenth of entry liquidity, so a flaky reading cannot invent
+absurd costs.
 
 Reported per rule and half: n, win rate, mean and median net return, total PnL,
 worst trade, the mean with each rule-half's three best trades removed, and a 95%
@@ -64,8 +69,23 @@ EXIT_LABEL = "1h"
 #: A pair that vanished by the exit returns this.
 TOTAL_LOSS_PCT = -100.0
 
+#: ``liq`` calls a trade a loss when the exit liquidity is missing or thin.
+EXIT_RULE_LIQ = "liq"
+
+#: ``price`` calls it a loss when the 1h price is missing, zero, or collapsed.
+EXIT_RULE_PRICE = "price"
+EXIT_RULE_CHOICES = (EXIT_RULE_LIQ, EXIT_RULE_PRICE)
+DEFAULT_EXIT_RULE = EXIT_RULE_LIQ
+
 #: An exit on less than this fraction of the entry liquidity counts as a loss.
 MIN_EXIT_LIQUIDITY_RATIO = 0.20
+
+#: With ``--exit-rule price``, a 1h price under this fraction of entry is a loss.
+MIN_EXIT_PRICE_RATIO = 0.10
+
+#: Floor on the liquidity used for exit impact, so a flaky reading cannot
+#: invent absurd costs.  Never below this fraction of the entry liquidity.
+MIN_IMPACT_LIQUIDITY_RATIO = 0.10
 
 #: Two-sided slippage multiplier on size / liquidity.
 IMPACT_FACTOR = 2.0
@@ -92,11 +112,18 @@ ORDER BY p.first_seen
 """
 
 
-def load_universe(path: str, entry_label: str = DEFAULT_ENTRY) -> list[dict[str, Any]]:
+def load_universe(
+    path: str,
+    entry_label: str = DEFAULT_ENTRY,
+    exit_rule: str = DEFAULT_EXIT_RULE,
+) -> list[dict[str, Any]]:
     """Eligible, tradable pumpswap pairs, oldest first.
 
     ``entry_label`` picks the milestone to enter on: its price is the entry, and
-    its market cap and liquidity are what the rules bucket on.  Opens SQLite
+    its market cap and liquidity are what the rules bucket on.  ``exit_rule``
+    picks when a trade counts as a total loss: ``liq`` also calls it when the
+    exit liquidity is missing or below a fifth of entry, ``price`` only when the
+    1h price itself is missing, zero, or under a tenth of entry.  Opens SQLite
     read-only so the simulator never runs the scanner's schema.
     """
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
@@ -118,15 +145,19 @@ def load_universe(path: str, entry_label: str = DEFAULT_ENTRY) -> list[dict[str,
         if entry_price is None or float(entry_price) <= 0.0:
             continue  # cannot enter, so it is not a trade
         exit_price = row["exit_price"]
+        entry_liquidity = float(row["entry_liquidity"])
         exit_liquidity = _number(row["exit_liquidity"])
         gone = (
             str(row["exit_status"]) == SNAPSHOT_DEAD
             or exit_price is None
             or float(exit_price) <= 0.0
-            # No liquidity left to sell into: the exit is worth nothing.
-            or exit_liquidity is None
-            or exit_liquidity < float(row["entry_liquidity"]) * MIN_EXIT_LIQUIDITY_RATIO
         )
+        if not gone and exit_rule == EXIT_RULE_LIQ:
+            # No liquidity left to sell into: the exit is worth nothing.
+            gone = exit_liquidity is None or exit_liquidity < entry_liquidity * MIN_EXIT_LIQUIDITY_RATIO
+        if not gone and exit_rule == EXIT_RULE_PRICE:
+            # The token still quotes, but the price has collapsed: treat it as gone.
+            gone = float(exit_price) < float(entry_price) * MIN_EXIT_PRICE_RATIO
         trades.append(
             {
                 "first_seen": str(row["first_seen"]),
@@ -221,11 +252,24 @@ def net_return(trade: dict[str, Any], size: float, fee: float) -> float:
     if trade["gone"]:
         return TOTAL_LOSS_PCT
     entry_impact = _impact(size, trade["entry_liquidity"])
-    exit_liquidity = trade["exit_liquidity"] or trade["entry_liquidity"]
-    exit_impact = _impact(size, exit_liquidity)
+    exit_impact = _impact(size, _impact_liquidity(trade))
     entry_cost = trade["entry_price"] * (1.0 + fee + entry_impact)
     proceeds = trade["entry_price"] * (1.0 + trade["raw_return"]) * (1.0 - fee - exit_impact)
     return (proceeds / entry_cost - 1.0) * 100.0
+
+
+def _impact_liquidity(trade: dict[str, Any]) -> float:
+    """Liquidity to size the exit impact against, floored.
+
+    Uses the 1h liquidity when it is present and sane, otherwise the entry
+    liquidity, and never less than ``MIN_IMPACT_LIQUIDITY_RATIO`` of entry: a
+    flaky liquidity reading must not manufacture absurd costs.
+    """
+    floor = trade["entry_liquidity"] * MIN_IMPACT_LIQUIDITY_RATIO
+    reported = trade["exit_liquidity"]
+    if reported is None or reported < floor:
+        return max(trade["entry_liquidity"], floor)
+    return float(reported)
 
 
 def _impact(size: float, liquidity: float) -> float:
@@ -408,6 +452,14 @@ def print_csv(rows: Sequence[tuple[str, ...]]) -> None:
         )
 
 
+
+def exit_rule_note(exit_rule: str) -> str:
+    """One line describing when this run books a trade as a total loss."""
+    shared = f"dead or missing or zero {EXIT_LABEL} price always returns {TOTAL_LOSS_PCT:.0f}%"
+    if exit_rule == EXIT_RULE_PRICE:
+        return shared + f", and so does a {EXIT_LABEL} price below {MIN_EXIT_PRICE_RATIO:.0%} of entry"
+    return shared + f", and so does missing exit liquidity or liquidity below {MIN_EXIT_LIQUIDITY_RATIO:.0%} of entry"
+
 def build_parser() -> argparse.ArgumentParser:
     """Command line interface of the simulator."""
     parser = argparse.ArgumentParser(
@@ -424,6 +476,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="milestone to enter on; its price is the entry and its market cap and "
         "liquidity are what the rules bucket on (default: 5m)",
     )
+    parser.add_argument(
+        "--exit-rule",
+        choices=EXIT_RULE_CHOICES,
+        default=DEFAULT_EXIT_RULE,
+        help="when a trade counts as a total loss: 'liq' (default) also when the "
+        "exit liquidity is missing or below a fifth of entry; 'price' only when "
+        "the 1h price is missing, zero, or under a tenth of entry",
+    )
     parser.add_argument("--csv", action="store_true", help="write CSV instead of the table")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
@@ -435,7 +495,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     make_output_robust()
 
     try:
-        trades = load_universe(args.db, args.entry)
+        trades = load_universe(args.db, args.entry, args.exit_rule)
     except sqlite3.Error as exc:
         print(f"{args.db}: {exc}", file=sys.stderr)
         print("hint: run scanner.py against this database first; it creates the snapshots table.", file=sys.stderr)
@@ -461,6 +521,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     print(f"meme-radar simulate -- {args.db}")
+    print(f"exit rule: {args.exit_rule}")
     print(
         f"{DEX}: {len(trades):,} tradable pairs ({args.entry} cap >= ${MIN_FIRST_MARKET_CAP:,.0f}, "
         f"{args.entry} liquidity >= ${MIN_FIRST_LIQUIDITY:,.0f}, positive {args.entry} price)"
@@ -479,7 +540,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"  {code}  {label}")
     print()
     print(f"costs: size ${args.size:,.2f} per trade, fee {args.fee * 100:.3f}% per side, impact ~{IMPACT_FACTOR:.0f} * size / liquidity per side")
-    print(f"       entry at the {args.entry} price, exit at the {EXIT_LABEL} price; dead, missing, or exit liquidity below {MIN_EXIT_LIQUIDITY_RATIO:.0%} of entry returns {TOTAL_LOSS_PCT:.0f}%")
+    print(f"       entry at the {args.entry} price, exit at the {EXIT_LABEL} price")
+    print(f"       exit rule '{args.exit_rule}': " + exit_rule_note(args.exit_rule))
+    print(f"       exit impact uses the {EXIT_LABEL} liquidity, floored at {MIN_IMPACT_LIQUIDITY_RATIO:.0%} of entry liquidity")
     print()
     print_table(rows)
     print(f"win = share of trades with a positive net return; 95% interval = {BOOTSTRAP_RESAMPLES:,}-resample bootstrap of the mean (seed {BOOTSTRAP_SEED})")
