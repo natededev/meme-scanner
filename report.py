@@ -274,7 +274,7 @@ def _csv_number(value: float | None) -> str:
 
 def print_csv(rows: list[tuple[str, dict[str, Any]]], group: str | None = None, header: bool = True) -> None:
     """CSV with raw numbers, so a spreadsheet can do its own maths."""
-    writer = csv.writer(sys.stdout)
+    writer = csv.writer(sys.stdout, lineterminator="\n")
     by_group = group is not None
     if header:
         writer.writerow((["group"] if by_group else []) + list(CSV_HEADERS))
