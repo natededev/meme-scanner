@@ -5,7 +5,13 @@ Read-only over the ledger written by ``scanner.py``.  Restricted to the two
 high-churn Solana launchpads, tokens that were already worth something when we
 first saw them, and pairs that had real liquidity.
 
-For each dex, tokens are bucketed by five first-seen traits:
+By default the baseline is the ``5m`` snapshot: the change is the 1h price
+divided by the 5m price minus one (both prices must be present and positive),
+and the buckets come from the 5m snapshot's liquidity, volume_5m and market cap.
+``--baseline first`` restores the older behaviour, where the change is measured
+against the pair's first-seen market cap and the buckets come from the pair.
+
+For each dex, tokens are bucketed by five traits:
 
 * ``volume_5m``      -- the launch-spike volume,
 * ``liquidity_usd``  -- how much was actually in the pool,
@@ -57,6 +63,13 @@ MIN_FIRST_LIQUIDITY = 1500.0
 #: Milestone whose outcome every statistic is measured at.
 OUTCOME_LABEL = "1h"
 
+#: Default baseline: the 5m snapshot, both for the change and the bucketing.
+BASELINE_5M = "5m"
+
+#: ``--baseline first`` restores the old behaviour (first-seen pair values).
+BASELINE_FIRST = "first"
+BASELINE_CHOICES = (BASELINE_5M, BASELINE_FIRST)
+
 #: Buckets with fewer samples than this are flagged THIN.
 MIN_BUCKET_SAMPLES = 100
 
@@ -77,24 +90,41 @@ SELECT p.pair_address,
        p.market_cap AS first_market_cap,
        p.volume_5m AS first_volume,
        COALESCE(p.dex_id, '') AS dex_id,
+       s.status,
        s.market_cap AS snapshot_market_cap,
+       s.price_usd AS snapshot_price,
        s.volume_5m AS snapshot_volume,
-       s.status
+       b.liquidity_usd AS base_liquidity,
+       b.market_cap AS base_market_cap,
+       b.volume_5m AS base_volume,
+       b.price_usd AS base_price,
+       b.status AS base_status
 FROM pairs AS p
 JOIN snapshots AS s ON s.pair_address = p.pair_address AND s.label = ?
+LEFT JOIN snapshots AS b ON b.pair_address = p.pair_address AND b.label = ?
 ORDER BY p.pair_address
 """
 
 
-def load_samples(path: str, label: str = OUTCOME_LABEL) -> tuple[list[dict[str, Any]], int]:
-    """Eligible pairs plus how many were dropped by the first-seen filters.
+def load_samples(
+    path: str,
+    label: str = OUTCOME_LABEL,
+    baseline: str = BASELINE_5M,
+) -> tuple[list[dict[str, Any]], int]:
+    """Eligible pairs plus how many rows were read.
+
+    ``baseline="5m"`` (the default) measures the change as the 1h price over the
+    5m price, and buckets on the 5m snapshot's liquidity, volume_5m and market
+    cap.  ``baseline="first"`` restores the old behaviour: the change is measured
+    against the pair's first-seen market cap and the buckets come from the pair.
 
     Opens SQLite read-only so the report never runs the scanner's schema.
     """
+    baseline_label = None if baseline == BASELINE_FIRST else BASELINE_5M
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
     try:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(_SAMPLE_SQL, (label,)).fetchall()
+        rows = conn.execute(_SAMPLE_SQL, (label, baseline_label)).fetchall()
     finally:
         conn.close()
 
@@ -116,24 +146,48 @@ def load_samples(path: str, label: str = OUTCOME_LABEL) -> tuple[list[dict[str, 
             continue
         if first_liq is None or float(first_liq) < MIN_FIRST_LIQUIDITY:
             continue
-        cap = row["snapshot_market_cap"]
-        change: float | None = None
-        if cap is not None:
-            change = (float(cap) - float(first_cap)) / float(first_cap) * 100.0
+
+        if baseline == BASELINE_FIRST:
+            traits = {
+                "first_volume": _number(row["first_volume"]),
+                "first_liquidity": float(first_liq),
+                "first_market_cap": float(first_cap),
+            }
+            reference = float(first_cap)
+            outcome_cap = row["snapshot_market_cap"]
+            price_change = (
+                None
+                if outcome_cap is None
+                else (float(outcome_cap) - reference) / reference * 100.0
+            )
+        else:
+            base_cap = row["base_market_cap"]
+            base_price = row["base_price"]
+            outcome_price = row["snapshot_price"]
+            traits = {
+                "first_volume": _number(row["base_volume"]),
+                "first_liquidity": _number(row["base_liquidity"]),
+                "first_market_cap": _number(base_cap),
+            }
+            # Both prices must be present and positive, else the pair is gone.
+            price_change = None
+            if base_price is not None and float(base_price) > 0.0:
+                if outcome_price is not None and float(outcome_price) > 0.0:
+                    price_change = (float(outcome_price) / float(base_price) - 1.0) * 100.0
+            reference = None
+
         key = (str(row["token"]), str(row["first_seen"])[:13])
         samples.append(
             {
                 "dex": dex,
                 "token": str(row["token"]),
-                "first_volume": _number(row["first_volume"]),
-                "first_liquidity": float(first_liq),
-                "first_market_cap": float(first_cap),
                 "age_minutes": _age_minutes(row["first_seen"], row["pair_created_at"]),
                 "copycats": by_symbol[key],
                 "first_seen": str(row["first_seen"]),
-                "change": change,
+                "change": price_change,
                 "snapshot_volume": _number(row["snapshot_volume"]),
-                "dead": str(row["status"]) == SNAPSHOT_DEAD or change is None,
+                "dead": str(row["status"]) == SNAPSHOT_DEAD or price_change is None,
+                **traits,
             }
         )
     return samples, seen
@@ -438,6 +492,19 @@ def _plain(cell: Any) -> Any:
     return text
 
 
+
+def baseline_note(baseline: str) -> str:
+    """One line describing what the change and the buckets are measured against."""
+    if baseline == BASELINE_FIRST:
+        return (
+            f"change = {OUTCOME_LABEL} market cap vs first-seen market cap; "
+            "buckets from the pair's first-seen liquidity, volume_5m and market cap"
+        )
+    return (
+        f"change = {OUTCOME_LABEL} price / {BASELINE_5M} price - 1 (both must be present and positive); "
+        f"buckets from the {BASELINE_5M} snapshot's liquidity, volume_5m and market cap"
+    )
+
 def build_parser() -> argparse.ArgumentParser:
     """Command line interface of the signal report."""
     parser = argparse.ArgumentParser(
@@ -446,6 +513,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--db", default=DEFAULT_DB, metavar="PATH", help="SQLite file (default: %(default)s)")
     parser.add_argument("--csv", action="store_true", help="write CSV instead of the tables")
+    parser.add_argument(
+        "--baseline",
+        choices=BASELINE_CHOICES,
+        default=BASELINE_5M,
+        help=(
+            "what to measure against at " + OUTCOME_LABEL + ": '5m' (default) uses the 5m snapshot's "
+            "price for the change and its liquidity, volume_5m and market cap for the "
+            "buckets; 'first' uses the pair's first-seen values"
+        ),
+    )
     parser.add_argument(
         "--split",
         action="store_true",
@@ -462,7 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     make_output_robust()
 
     try:
-        samples, scanned = load_samples(args.db)
+        samples, scanned = load_samples(args.db, baseline=args.baseline)
     except sqlite3.Error as exc:
         print(f"{args.db}: {exc}", file=sys.stderr)
         print("hint: run scanner.py against this database first; it creates the snapshots table.", file=sys.stderr)
@@ -475,7 +552,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"No eligible pairs in {args.db} yet.")
             print(
                 f"Need dex in ({', '.join(DEXES)}), first-seen market cap >= ${MIN_FIRST_MARKET_CAP:,.0f}, "
-                f"liquidity >= ${MIN_FIRST_LIQUIDITY:,.0f}, and a {OUTCOME_LABEL} snapshot."
+                f"liquidity >= ${MIN_FIRST_LIQUIDITY:,.0f}, a {OUTCOME_LABEL} snapshot"
+                + (f" and a {BASELINE_5M} snapshot." if args.baseline == BASELINE_5M else ".")
             )
         return 0
 
@@ -493,13 +571,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     print(f"meme-radar signals -- {args.db}")
+    print(f"baseline: {args.baseline}")
     print(
         f"{scanned:,} pair(s) with a {OUTCOME_LABEL} snapshot; {len(samples):,} pass "
         f"dex in ({', '.join(DEXES)}) and first-seen cap >= ${MIN_FIRST_MARKET_CAP:,.0f} "
         f"and liquidity >= ${MIN_FIRST_LIQUIDITY:,.0f}"
     )
-    print(f"stagnant = {OUTCOME_LABEL} volume_5m < ${NEAR_ZERO_VOLUME:,.0f} and market cap within {UNCHANGED_PCT:.0f}% of first seen")
-    print(f"gone = dead at {OUTCOME_LABEL} or no market cap; counted as down>90% and kept in n")
+    print(baseline_note(args.baseline))
+    print(f"stagnant = {OUTCOME_LABEL} volume_5m < ${NEAR_ZERO_VOLUME:,.0f} and change within {UNCHANGED_PCT:.0f}% of the baseline")
+    print(f"gone = dead at {OUTCOME_LABEL} or an unusable baseline/outcome value; counted as down>90% and kept in n")
     print(f"lift = bucket up>2x share / that dex's BASELINE up>2x share")
     print(f"THIN marks a bucket with fewer than {MIN_BUCKET_SAMPLES} samples")
     print()
